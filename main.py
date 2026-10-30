@@ -3107,8 +3107,10 @@ def is_link_expired(link: dict) -> bool:
     if not exp:
         return False
     try:
-        return datetime.now() > datetime.fromisoformat(exp)
-    except Exception:
+        expires_at = datetime.fromisoformat(str(exp))
+        now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
+        return now > expires_at
+    except (TypeError, ValueError, OverflowError):
         return False
 
 def is_link_allowed(link: dict | None) -> bool:
@@ -4115,6 +4117,62 @@ async def runtime_public_endpoint(request: Request):
 
 
 # ── Public subscription endpoint (link/uuid) ────────────────────────────────
+
+# Subscription-client / HTTP-library markers. Any of these appearing in the
+# User-Agent means the request is almost certainly a VPN client (or a script)
+# updating its subscription, never a person reading the page in a browser —
+# even though many of these clients' underlying HTTP stack puts the word
+# "Mozilla" in the User-Agent for CDN/compatibility reasons. Checking for
+# "mozilla" alone (as before) misidentified those clients as browsers and
+# served them the HTML page instead of the base64 config list, so their
+# "update subscription" silently failed. This list is checked first and
+# always wins over any browser-looking signal.
+_SUB_CLIENT_UA_MARKERS = (
+    "v2ray", "v2box", "nekoray", "nekobox", "neko-box", "clash", "mihomo",
+    "sing-box", "singbox", "hiddify", "shadowrocket", "quantumult", "surge",
+    "stash", "loon", "streisand", "happ", "flclash", "karing", "napsternetv",
+    "pharos", "matsuri", "kitsunebi", "passflow", "furious", "outline",
+    "sub-store", "substore", "subconverter", "husi", "amnezia", "throne",
+    "liberty", "foxray", "v2rayn", "v2rayng", "xray", "qv2ray", "invizible",
+    "wings", "okhttp", "python-requests", "python-urllib", "go-http-client",
+    "node-fetch", "axios", "curl", "wget", "libcurl", "aiohttp", "java/",
+    "dart", "winhttp", "lua-resty", "httpclient",
+)
+
+
+def _subscription_wants_html(request: Request) -> bool:
+    """True only when this request looks like a real browser navigating to
+    the page, so it should receive the human-readable sub.html page instead
+    of the raw base64 subscription payload. Defaults to "raw" whenever it's
+    unsure, since the link's main job is being fetched by VPN apps, not
+    viewed — and apps mis-detected as browsers is exactly what breaks
+    "update subscription" in the client."""
+    ua = (request.headers.get("user-agent") or "").lower()
+    accept = (request.headers.get("accept") or "").lower()
+
+    if any(marker in ua for marker in _SUB_CLIENT_UA_MARKERS):
+        return False
+
+    # Real browsers doing a top-level navigation (typing/pasting the URL,
+    # clicking a link) send this Fetch-Metadata header; virtually no HTTP
+    # library or VPN client does, so it is a much stronger signal than
+    # "mozilla" showing up somewhere in the User-Agent string.
+    if (request.headers.get("sec-fetch-mode") or "").lower() == "navigate":
+        return True
+
+    looks_like_browser_engine = any(
+        tok in ua for tok in (
+            "chrome/", "crios/", "firefox/", "fxios/", "edg/", "edga/",
+            "edgios/", "opr/", "samsungbrowser/",
+        )
+    ) or ("safari/" in ua and "version/" in ua)
+
+    if looks_like_browser_engine and "text/html" in accept:
+        return True
+
+    return False
+
+
 async def _find_user_by_config_uuid(config_uuid: str):
     async with USERS_LOCK:
         for uid, u in USERS.items():
@@ -4134,7 +4192,7 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
     uid, user = await _find_user_by_config_uuid(config_uuid)
     if not user:
         async with LINKS_LOCK:
-            link = LINKS.get(config_uuid)
+            link = dict(LINKS.get(config_uuid) or {})
         if link and is_link_allowed(link):
             host = SETTINGS.get("domain") or get_host()
             proto = link.get("protocol", DEFAULT_PROTOCOL)
@@ -4144,6 +4202,31 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
                 remark=f"Spider-{link['label']}",
                 protocol=proto,
             )
+
+            # Raw links use the link's own timestamps and the panel-wide IP
+            # limit. Include them in the public page data too, otherwise the
+            # daily average, expiry header and connection-limit tile would
+            # fall back to misleading defaults for this account type.
+            created_at_ts = None
+            created_at = link.get("created_at")
+            if created_at:
+                try:
+                    created_at_ts = int(datetime.fromisoformat(str(created_at)).timestamp())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
+            expires_at = link.get("expires_at")
+            expire_at_ts = None
+            expire_days = None
+            if expires_at:
+                try:
+                    exp = datetime.fromisoformat(str(expires_at))
+                    now = datetime.now(exp.tzinfo) if exp.tzinfo else datetime.now()
+                    expire_at_ts = int(exp.timestamp())
+                    expire_days = max(0, (exp - now).days)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
             return {
                 "username": link.get("label", config_uuid),
                 "config_uuid": config_uuid,
@@ -4151,10 +4234,17 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
                 "config": vless,
                 "status": "active",
                 "is_active": True,
-                "traffic_used_bytes": link.get("used_bytes", 0),
-                "traffic_limit_bytes": link.get("limit_bytes", 0),
-                "traffic_used_fmt": fmt_bytes(link.get("used_bytes", 0)),
-                "traffic_limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link.get("limit_bytes", 0)),
+                "traffic_used_bytes": int(link.get("used_bytes", 0) or 0),
+                "traffic_limit_bytes": int(link.get("limit_bytes", 0) or 0),
+                "traffic_used_fmt": fmt_bytes(int(link.get("used_bytes", 0) or 0)),
+                "traffic_limit_fmt": "∞" if not link.get("limit_bytes", 0) else fmt_bytes(int(link.get("limit_bytes", 0) or 0)),
+                "created_at": created_at,
+                "created_at_ts": created_at_ts,
+                "expire_at": expires_at,
+                "expire_at_ts": expire_at_ts,
+                "expire_days": expire_days,
+                "max_ip_per_user": int(SETTINGS.get("max_ip_per_user", 3) if SETTINGS.get("max_ip_per_user") is not None else 3),
+                "used_ips": len(USER_IP_MAP.get(f"link:{config_uuid}", set())),
                 "inbound_ids": [],
                 "path": "",
                 "sni": "",
@@ -4174,10 +4264,11 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
     expire_at_ts = None
     if user.get("expire_at"):
         try:
-            exp = datetime.fromisoformat(user["expire_at"])
+            exp = datetime.fromisoformat(str(user["expire_at"]))
+            now = datetime.now(exp.tzinfo) if exp.tzinfo else datetime.now()
             expire_at_ts = int(exp.timestamp())
-            expire_days = max(0, (exp - datetime.now()).days)
-        except Exception:
+            expire_days = max(0, (exp - now).days)
+        except (TypeError, ValueError, OverflowError):
             pass
 
     created_at_ts = None
@@ -4199,10 +4290,12 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
         _exp = user.get("expire_at")
         if _exp:
             try:
-                if datetime.now() > datetime.fromisoformat(_exp):
+                _exp_dt = datetime.fromisoformat(str(_exp))
+                _now_dt = datetime.now(_exp_dt.tzinfo) if _exp_dt.tzinfo else datetime.now()
+                if _now_dt > _exp_dt:
                     status = "expired"
                     user["status"] = "expired"
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 pass
         if status == "active":
             _lb = user.get("traffic_limit_bytes", 0)
@@ -4333,29 +4426,28 @@ async def link_page(uuid: str, request: Request):
     The public identifier is UUID-only; username URLs are not supported.
     """
     data = await _build_subscription_data_by_uuid(uuid)
-    accept = (request.headers.get("accept") or "").lower()
-    user_agent = (request.headers.get("user-agent") or "").lower()
 
-    wants_html = (
-        "text/html" in accept
-        or "application/xhtml+xml" in accept
-        or "mozilla" in user_agent
-    )
-
-    if wants_html:
+    if _subscription_wants_html(request):
         return FileResponse(_os.path.join(_STATIC_DIR, "sub.html"))
 
     content = base64.b64encode("\n".join(data["configs"]).encode()).decode()
     username = data.get("username") or uuid
-    return Response(
-        content=content,
-        media_type="text/plain",
-        headers={
-            "profile-title": quote(username),
-            "profile-update-interval": "12",
-            "support-url": "https://t.me/spider_vpn1",
-        },
-    )
+    limit = int(data.get("traffic_limit_bytes") or 0)
+    used = int(data.get("traffic_used_bytes") or 0)
+    headers = {
+        "profile-title": quote(username),
+        "profile-update-interval": "12",
+        "support-url": "https://t.me/spider_vpn1",
+        # Standard subscription-userinfo header: lets clients (v2rayNG, Clash,
+        # Hiddify, …) show the real used/total/expiry straight from the
+        # panel's own numbers instead of guessing.
+        "subscription-userinfo": (
+            f"upload=0; download={used}; total={limit}"
+            + (f"; expire={data['expire_at_ts']}" if data.get("expire_at_ts") else "")
+        ),
+        "content-disposition": f"attachment; filename={quote(username)}",
+    }
+    return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
 
 
 @app.get("/sub-all")
